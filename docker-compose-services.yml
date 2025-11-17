@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    command: "mosquitto -c /mosquitto-no-auth.conf"
+    container_name: mosquitto
+    ports:
+      - 1883:1883
+    networks:
+      - be_network
+
+  dynamodb:
+    image: amazon/dynamodb-local:2.6.1
+    container_name: dynamodb
+    ports:
+      - 9000:8000
+    volumes:
+      - ./docker/dynamodb:/home/dynamodblocal/data
+    working_dir: /home/dynamodblocal
+    networks:
+      - be_network
+
+networks:
+  be_network:

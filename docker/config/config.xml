@@ -1,0 +1,15 @@
+<content>
+    <broker>
+        <host>mosquitto</host>
+        <port>1883</port>
+        <username></username>
+        <user-password></user-password>
+    </broker>
+    <database>
+        <host>dynamodb</host>
+        <port>8000</port>
+        <region>local</region>
+        <access-key-id>fakeMyKeyId</access-key-id>
+        <secret-access-key>fakeSecretAccessKey</secret-access-key>
+    </database>
+</content>

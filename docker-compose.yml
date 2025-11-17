@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    command: "mosquitto -c /mosquitto-no-auth.conf"
+    container_name: mosquitto
+    ports:
+      - 1883:1883
+    networks:
+      - be_network
+
+  dynamodb:
+    image: amazon/dynamodb-local:2.6.1
+    container_name: dynamodb
+    ports:
+      - 8000:8000
+    volumes:
+      - ./docker/dynamodb:/home/dynamodblocal/data
+    working_dir: /home/dynamodblocal
+    networks:
+      - be_network
+
+  supervisor:
+    build: ../egsm-supervisor
+    container_name: supervisor
+    volumes:
+      - ./docker/logs:/app/log
+      - ./docker/config:/app/config
+    ports:
+      - 8081:8081
+    depends_on:
+      - mosquitto
+      - dynamodb
+    networks:
+      - be_network
+      
+  aggregator:
+    build: ../egsm-aggregator
+    container_name: aggregator
+    ports:
+      - 9201-9400:9201-9400
+    volumes:
+      - ./docker/logs:/app/log
+      - ./docker/config:/app/config
+    depends_on:
+      - mosquitto
+      - dynamodb
+    networks:
+      - be_network
+      
+  worker:
+    build: ../egsm-worker
+    container_name: worker
+    ports:
+      - 9001-9200:9001-9200
+    volumes:
+      - ./docker/config:/app/config
+      - ./docker/logs:/app/log
+    depends_on:
+      - mosquitto
+      - dynamodb
+    networks:
+      - be_network
+    
+  frontend:
+    build: ../egsm-frontend
+    container_name: frontend
+    volumes:
+      - ./docker/logs:/app/log
+    ports:
+      - 4200:4200
+    depends_on:
+      - mosquitto
+      - dynamodb
+    networks:
+      - be_network
+      
+#  emulator:
+#    build: ../artifact-emulator
+#    container_name: emulator
+#    volumes:
+#      - ./docker/logs:/app/log
+#    depends_on:
+#      - mosquitto
+#    networks:
+#      - be_network
+
+networks:
+  be_network:
