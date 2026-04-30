@@ -1,90 +1,248 @@
-version: '3.8'
-
 services:
+  # MQTT Broker
   mosquitto:
-    image: eclipse-mosquitto:2
-    command: "mosquitto -c /mosquitto-no-auth.conf"
+    image: eclipse-mosquitto:latest
     container_name: mosquitto
     ports:
-      - 1883:1883
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
     networks:
-      - be_network
+      - app-network
+  
+  localstack:
+    container_name: localstack
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=dynamodb,dynamodbstreams,kinesis
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - DEBUG=1
+      - PERSISTENCE=1
+      - LOCALSTACK_AUTH_TOKEN=ls-MIqApAMe-1948-QOye-dIsa-KETE6759cd78
+    volumes:
+      - ./localstack/localstack-volume:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - app-network
+  
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin
+    container_name: dynamodb-admin
+    ports:
+      - "8001:8001"
+    environment:
+      DYNAMO_ENDPOINT: "http://localstack:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    depends_on:
+      - localstack
+    networks:
+      - app-network
+  
+  postgres:
+    image: postgres:17
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppassword
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    networks:
+      - app-network
 
-  dynamodb:
-    image: amazon/dynamodb-local:2.6.1
-    container_name: dynamodb
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_LISTEN_PORT: 5050
     ports:
-      - 8000:8000
-    volumes:
-      - ./docker/dynamodb:/home/dynamodblocal/data
-    working_dir: /home/dynamodblocal
+      - "5050:5050"
+    depends_on:
+      - postgres
     networks:
-      - be_network
+      - app-network
+  
+  aws-endpoint-proxy:
+    image: nginx:stable
+    container_name: aws-endpoint-proxy
+    depends_on:
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      app-network:
+        aliases:
+          - kinesis.us-east-1.amazonaws.com
+  
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    environment:
+    - AWS_ACCESS_KEY_ID=test
+    - AWS_SECRET_ACCESS_KEY=test
+    - AWS_DEFAULT_REGION=us-east-1
+    - AWS_REGION=us-east-1
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+      --host spark-master
+      --port 7078
+      --webui-port 8082
+    ports:
+      - "7078:7078"
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8082 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - ./spark/app:/opt/spark/app
+      - ./spark/jars:/opt/spark/custom-jars
+      - ./spark/checkpoints:/opt/spark/checkpoints
+    networks:
+      - app-network
+  
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    environment:
+    - AWS_ACCESS_KEY_ID=test
+    - AWS_SECRET_ACCESS_KEY=test
+    - AWS_DEFAULT_REGION=us-east-1
+    - AWS_REGION=us-east-1
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7078
+    volumes:
+      - ./spark/app:/opt/spark/app
+      - ./spark/jars:/opt/spark/custom-jars
+      - ./spark/checkpoints:/opt/spark/checkpoints
+    networks:
+      - app-network
+  
+  spark-submit:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-submit
+    environment:
+    - AWS_ACCESS_KEY_ID=test
+    - AWS_SECRET_ACCESS_KEY=test
+    - AWS_DEFAULT_REGION=us-east-1
+    - AWS_REGION=us-east-1
+    depends_on:
+      localstack:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    command: >
+      /bin/bash -lc "
+      until curl -f http://localstack:4566/_localstack/health; do echo 'waiting for localstack'; sleep 5; done;
+      until curl -f http://spark-master:8082; do echo 'waiting for spark-master'; sleep 5; done;
+      cd /opt/spark/app &&
+      rm -f etl.zip &&
+      zip -r etl.zip etl -x 'etl/__pycache__/*' -x 'processors/__pycache__/*' -x 'utils/__pycache__/*' -x 'db/__pycache__/*' &&
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7078
+      --deploy-mode client
+      --conf spark.jars.ivy=/opt/spark/.ivy2
+      --jars /opt/spark/custom-jars/spark-streaming-sql-kinesis-connector_2.12-1.1.0.jar,/opt/spark/custom-jars/postgresql-42.7.10.jar
+      --packages software.amazon.awssdk:bundle:2.25.53
+      --py-files /opt/spark/app/etl.zip
+      /opt/spark/app/etl/main.py
+      "
+    volumes:
+      - ./spark/app:/opt/spark/app
+      - ./spark/jars:/opt/spark/custom-jars
+      - ./spark/checkpoints:/opt/spark/checkpoints
+    networks:
+      - app-network
 
-  supervisor:
-    build: ../egsm-supervisor
-    container_name: supervisor
-    volumes:
-      - ./docker/logs:/app/log
-      - ./docker/config:/app/config
+  # Your first application
+  egsm-worker:
+    build:
+      context: ./egsm-worker
+      dockerfile: Dockerfile
+    container_name: egsm-worker
     ports:
-      - 8081:8081
+      - "9001-9200:9001-9200"
     depends_on:
       - mosquitto
-      - dynamodb
+      - localstack
     networks:
-      - be_network
-      
-  aggregator:
-    build: ../egsm-aggregator
-    container_name: aggregator
+      - app-network
+  
+  egsm-supervisor:
+    build:
+      context: ./egsm-supervisor
+      dockerfile: Dockerfile
+    container_name: egsm-supervisor
     ports:
-      - 9201-9400:9201-9400
-    volumes:
-      - ./docker/logs:/app/log
-      - ./docker/config:/app/config
+      - "8081:8081"
     depends_on:
       - mosquitto
-      - dynamodb
+      - localstack
     networks:
-      - be_network
-      
-  worker:
-    build: ../egsm-worker
-    container_name: worker
-    ports:
-      - 9001-9200:9001-9200
-    volumes:
-      - ./docker/config:/app/config
-      - ./docker/logs:/app/log
-    depends_on:
-      - mosquitto
-      - dynamodb
-    networks:
-      - be_network
-    
-  frontend:
-    build: ../egsm-frontend
-    container_name: frontend
-    volumes:
-      - ./docker/logs:/app/log
-    ports:
-      - 4200:4200
-    depends_on:
-      - mosquitto
-      - dynamodb
-    networks:
-      - be_network
-      
-#  emulator:
-#    build: ../artifact-emulator
-#    container_name: emulator
-#    volumes:
-#      - ./docker/logs:/app/log
-#    depends_on:
-#      - mosquitto
-#    networks:
-#      - be_network
+      - app-network
 
+  egsm-aggregator:
+    build:
+      context: ./egsm-aggregator
+      dockerfile: Dockerfile
+    container_name: egsm-aggregator
+    ports:
+      - "9201-9400:9201-9400"
+    depends_on:
+      - mosquitto
+      - localstack
+    networks:
+      - app-network
+  
+  # egsm-frontend:
+  #   build:
+  #     context: ./egsm-frontend
+  #     dockerfile: Dockerfile
+  #   container_name: egsm-frontend
+  #   ports:
+  #     - "4200:4200"
+  #   depends_on:
+  #     - mosquitto
+  #     - localstack
+  #   networks:
+  #     - app-network
+
+# Shared network for all services
 networks:
-  be_network:
+  app-network:
+    driver: bridge
